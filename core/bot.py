@@ -12,6 +12,11 @@ import os
 import signal
 from typing import Any, Optional
 
+# Precisa vir ANTES do legacy_runtime, porque o KaynBot e criado durante essa
+# importacao. Se ficar depois, o bot nasce sem members intent e o Discord nao
+# entrega eventos de entrar/sair/banir membros.
+os.environ["KAYN_ENABLE_MEMBERS_INTENT"] = "true"
+
 from cogs import legacy_runtime as legacy
 
 bot = legacy.bot
@@ -25,14 +30,11 @@ def _force_required_gateway_intents() -> None:
     """Garante intents necessarios para eventos de moderacao/servidor.
 
     Entrada, saida, banimento e alteracao de cargos dependem do Server Members
-    Intent. No runtime legado o padrao vinha de KAYN_ENABLE_MEMBERS_INTENT=false,
-    entao os listeners existiam, mas o Discord nao enviava os eventos.
-
-    Isto nao escolhe canais automaticamente: as mensagens continuam indo somente
-    para os canais configurados pelos comandos do proprio Kayn.
+    Intent. Isto nao escolhe canais automaticamente: as mensagens continuam indo
+    somente para os canais configurados pelos comandos do proprio Kayn.
     """
     try:
-        os.environ.setdefault("KAYN_ENABLE_MEMBERS_INTENT", "true")
+        os.environ["KAYN_ENABLE_MEMBERS_INTENT"] = "true"
 
         intents = getattr(bot, "intents", None)
         if intents is not None:
@@ -51,7 +53,7 @@ def _force_required_gateway_intents() -> None:
             state_intents.message_content = True
             state_intents.voice_states = True
 
-        logger.info("Kayn intents obrigatorios ativos: guilds/members/messages/message_content/voice_states")
+        logger.info("Kayn intents obrigatorios ativos antes do login: guilds/members/messages/message_content/voice_states")
     except Exception:
         with contextlib.suppress(Exception):
             logger.error("Falha ao ativar intents obrigatorios do Kayn", exc_info=True)
