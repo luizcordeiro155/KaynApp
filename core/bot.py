@@ -12,8 +12,6 @@ import os
 import signal
 from typing import Any, Optional
 
-import discord
-
 from cogs import legacy_runtime as legacy
 
 bot = legacy.bot
@@ -29,6 +27,9 @@ def _force_required_gateway_intents() -> None:
     Entrada, saida, banimento e alteracao de cargos dependem do Server Members
     Intent. No runtime legado o padrao vinha de KAYN_ENABLE_MEMBERS_INTENT=false,
     entao os listeners existiam, mas o Discord nao enviava os eventos.
+
+    Isto nao escolhe canais automaticamente: as mensagens continuam indo somente
+    para os canais configurados pelos comandos do proprio Kayn.
     """
     try:
         os.environ.setdefault("KAYN_ENABLE_MEMBERS_INTENT", "true")
@@ -56,67 +57,7 @@ def _force_required_gateway_intents() -> None:
             logger.error("Falha ao ativar intents obrigatorios do Kayn", exc_info=True)
 
 
-def _normalize_channel_name(name: str) -> str:
-    table = str.maketrans({
-        "á": "a", "à": "a", "ã": "a", "â": "a", "ä": "a",
-        "é": "e", "ê": "e", "è": "e", "ë": "e",
-        "í": "i", "ì": "i", "î": "i", "ï": "i",
-        "ó": "o", "ò": "o", "õ": "o", "ô": "o", "ö": "o",
-        "ú": "u", "ù": "u", "û": "u", "ü": "u",
-        "ç": "c",
-    })
-    return (name or "").lower().translate(table).replace("_", "-").strip()
-
-
-def _find_text_channel_by_names(guild: discord.Guild, names: list[str]) -> Optional[discord.TextChannel]:
-    wanted = {_normalize_channel_name(n) for n in names if n}
-    try:
-        for channel in getattr(guild, "text_channels", []) or []:
-            if _normalize_channel_name(getattr(channel, "name", "")) in wanted:
-                return channel
-    except Exception:
-        with contextlib.suppress(Exception):
-            logger.debug("Excecao silenciosa ignorada pelo Kayn", exc_info=True)
-    return None
-
-
-def _install_welcome_channel_fallbacks() -> None:
-    """Usa canais padrao quando o servidor ainda nao configurou a tabela.
-
-    O sistema legado salva canais via !setboasvindas/!setdespedida/!setbanidos.
-    Se o banco novo ainda nao tem essas configs, o Kayn agora tenta achar os
-    canais comuns do servidor automaticamente.
-    """
-    old_get_channel = getattr(legacy, "kayn_v140_get_configured_channel", None)
-    if not callable(old_get_channel):
-        return
-
-    if getattr(bot, "_kayn_core_welcome_fallbacks", False):
-        return
-
-    def patched_get_configured_channel(guild: discord.Guild, kind: str) -> Optional[discord.TextChannel]:
-        channel = None
-        with contextlib.suppress(Exception):
-            channel = old_get_channel(guild, kind)
-        if channel:
-            return channel
-
-        kind_norm = str(kind or "").strip().lower()
-        fallback_names = {
-            "welcome": ["bem-vindo", "bem-vindos", "boas-vindas", "boasvindas", "welcome"],
-            "farewell": ["sairam-do-servidor", "saíram-do-servidor", "saidas", "saídas", "despedida", "despedidas", "goodbye"],
-            "ban": ["banidos", "banido", "punicoes", "punições", "expulsos", "moderacao", "moderação"],
-            "kick": ["banidos", "banido", "punicoes", "punições", "expulsos", "moderacao", "moderação"],
-        }.get(kind_norm, [])
-        return _find_text_channel_by_names(guild, fallback_names)
-
-    legacy.kayn_v140_get_configured_channel = patched_get_configured_channel
-    bot._kayn_core_welcome_fallbacks = True
-    logger.info("Kayn fallback de canais boas-vindas/despedida/banidos instalado.")
-
-
 _force_required_gateway_intents()
-_install_welcome_channel_fallbacks()
 
 
 def _install_signal_handlers() -> None:
@@ -164,7 +105,6 @@ def _restart_after_delay(seconds: int, reason: str) -> None:
 def run(token: Optional[str] = None, *args: Any, **kwargs: Any) -> None:
     """Executa o bot com o mesmo backoff/limpeza do antigo bloco `if __main__`."""
     _force_required_gateway_intents()
-    _install_welcome_channel_fallbacks()
     _install_signal_handlers()
 
     apply_logging = getattr(legacy, "kayn_v205_apply_error_only_logging", None)
