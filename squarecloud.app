@@ -1,0 +1,6 @@
+DISPLAY_NAME=Kayn
+MEMORY=2000
+VERSION=recommended
+AUTORESTART=true
+MAIN=main.py
+SUBDOMAIN=kaynbotia
