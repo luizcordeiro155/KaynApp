@@ -55,6 +55,8 @@ _EVENT_LOOP_THREAD_FUNCTIONS = (
     "kayn_v47_apply_due_roll_resets",
 )
 _EVENT_LOOP_THREAD_MAX_RUNNING = 4
+_ROLL_DELIVERY_GUARD_INSTALLED = False
+_ROLL_DELIVERY_GUARD_LOCK = threading.RLock()
 
 
 def _force_required_gateway_intents() -> None:
@@ -207,6 +209,106 @@ def _install_event_loop_thread_guards() -> None:
         _EVENT_LOOP_THREAD_GUARD_INSTALLED = True
 
 
+def _roll_result_get(result: Any, *keys: str) -> Any:
+    for key in keys:
+        try:
+            if isinstance(result, dict) and result.get(key) not in (None, ""):
+                return result.get(key)
+            value = getattr(result, key, None)
+            if value not in (None, ""):
+                return value
+        except Exception:
+            continue
+    return None
+
+
+def _roll_result_fallback_message(result: Any) -> str:
+    asset = _roll_result_get(result, "asset") or {}
+    name = (
+        _roll_result_get(result, "name", "asset_name", "title", "display_name")
+        or _roll_result_get(asset, "name", "asset_name", "title", "display_name")
+        or "resultado do roll"
+    )
+    rarity = _roll_result_get(result, "rarity") or _roll_result_get(asset, "rarity")
+    kind = _roll_result_get(result, "kind", "type") or _roll_result_get(asset, "kind", "type")
+    asset_id = _roll_result_get(result, "asset_id", "id") or _roll_result_get(asset, "asset_id", "id")
+
+    parts = [f"🎲 **Resultado do roll:** **{name}**"]
+    if rarity:
+        parts.append(f"⭐ **Raridade:** `{rarity}`")
+    if kind:
+        parts.append(f"📦 **Tipo:** `{kind}`")
+    if asset_id:
+        parts.append(f"🆔 **ID:** `{asset_id}`")
+    parts.append("⚠️ O card visual falhou, mas o roll foi entregue em texto e não foi devolvido.")
+    return "\n".join(parts)[:1900]
+
+
+async def _send_roll_text_fallback(ctx: Any, result: Any) -> bool:
+    message = _roll_result_fallback_message(result)
+    allowed_mentions = discord.AllowedMentions.none()
+    for sender_name in ("reply", "send"):
+        sender = getattr(ctx, sender_name, None)
+        if not callable(sender):
+            continue
+        try:
+            kwargs = {"allowed_mentions": allowed_mentions}
+            if sender_name == "reply":
+                kwargs["mention_author"] = False
+            sent = await asyncio.wait_for(sender(message, **kwargs), timeout=8.0)
+            return sent is not None
+        except TypeError:
+            try:
+                sent = await asyncio.wait_for(sender(message), timeout=8.0)
+                return sent is not None
+            except Exception:
+                continue
+        except Exception:
+            continue
+    return False
+
+
+def _install_roll_delivery_guard() -> None:
+    """Garante que !roll entregue texto quando o card/imagem falhar.
+
+    O legado devolve o roll quando kayn_v86_deliver_roll_result retorna False.
+    Em producao isso estava acontecendo apenas com !roll, indicando falha no
+    envio do card/anexo/embed, nao no sorteio. Este guard tenta o card normal e,
+    se falhar, envia uma resposta textual e retorna True para evitar refund falso.
+    """
+    global _ROLL_DELIVERY_GUARD_INSTALLED
+    with _ROLL_DELIVERY_GUARD_LOCK:
+        if _ROLL_DELIVERY_GUARD_INSTALLED:
+            return
+        original = getattr(legacy, "kayn_v86_deliver_roll_result", None)
+        if not callable(original) or getattr(original, "_kayn_roll_delivery_guard", False):
+            _ROLL_DELIVERY_GUARD_INSTALLED = True
+            return
+
+        async def guarded_roll_delivery(ctx: Any, result: Any, *args: Any, **kwargs: Any) -> bool:
+            try:
+                ok = await original(ctx, result, *args, **kwargs)
+                if ok:
+                    return True
+                with contextlib.suppress(Exception):
+                    logger.warning("Kayn !roll: card delivery retornou falso; tentando fallback em texto.")
+            except Exception:
+                with contextlib.suppress(Exception):
+                    logger.error("Kayn !roll: card delivery falhou; tentando fallback em texto.", exc_info=True)
+
+            fallback_ok = await _send_roll_text_fallback(ctx, result)
+            if fallback_ok:
+                return True
+            with contextlib.suppress(Exception):
+                logger.error("Kayn !roll: fallback em texto tambem falhou.")
+            return False
+
+        guarded_roll_delivery._kayn_roll_delivery_guard = True  # type: ignore[attr-defined]
+        guarded_roll_delivery._kayn_roll_delivery_original = original  # type: ignore[attr-defined]
+        setattr(legacy, "kayn_v86_deliver_roll_result", guarded_roll_delivery)
+        _ROLL_DELIVERY_GUARD_INSTALLED = True
+
+
 def _make_schema_guard(name: str, original: Any):
     state = {"done": False, "running": False}
     lock = threading.RLock()
@@ -256,14 +358,7 @@ def _make_schema_guard(name: str, original: Any):
 
 
 def _install_schema_guard() -> None:
-    """Evita DDL/ensure_schema sincronas no event loop do Discord.
-
-    Os logs de producao mostram heartbeat blocked enquanto on_ready/tasks chamam
-    ensure_schema() e psycopg fica aguardando cur.execute(). Essas chamadas sao
-    sincronas; se rodam no event loop, o gateway para de responder. A solucao e
-    preaquecer o schema antes do login e transformar chamadas posteriores em
-    no-op, ou thread quando ainda nao tiverem rodado.
-    """
+    """Evita DDL/ensure_schema sincronas no event loop do Discord."""
     global _SCHEMA_GUARD_INSTALLED
     with _SCHEMA_GUARD_LOCK:
         if _SCHEMA_GUARD_INSTALLED:
@@ -277,12 +372,7 @@ def _install_schema_guard() -> None:
 
 
 def _prewarm_schema_before_gateway() -> None:
-    """Roda migracoes antes de abrir o gateway do Discord.
-
-    Se o banco demorar ou algum indice bloquear, isso atrasa apenas o startup.
-    Depois que o gateway estiver conectado, chamadas repetidas de ensure_schema
-    nao travam mais o heartbeat.
-    """
+    """Roda migracoes antes de abrir o gateway do Discord."""
     global _SCHEMA_PREWARMED
     if _SCHEMA_PREWARMED or os.getenv("KAYN_SKIP_SCHEMA_PREWARM", "").lower() in {"1", "true", "yes", "on"}:
         return
@@ -327,6 +417,7 @@ _force_required_gateway_intents()
 _install_safe_message_send()
 _install_schema_guard()
 _install_event_loop_thread_guards()
+_install_roll_delivery_guard()
 
 
 def _install_signal_handlers() -> None:
@@ -348,7 +439,6 @@ def _close_http_session_safely() -> None:
     try:
         asyncio.run(close_http_session())
     except RuntimeError:
-        # Se ja existir loop, o discord.py cuidara do encerramento principal.
         pass
     except Exception:
         with contextlib.suppress(Exception):
@@ -377,6 +467,7 @@ def run(token: Optional[str] = None, *args: Any, **kwargs: Any) -> None:
     _install_safe_message_send()
     _install_schema_guard()
     _install_event_loop_thread_guards()
+    _install_roll_delivery_guard()
     _prewarm_schema_before_gateway()
     _prewarm_maintenance_before_gateway()
     _install_signal_handlers()
