@@ -32,14 +32,10 @@ _SCHEMA_GUARD_INSTALLED = False
 _SCHEMA_PREWARMED = False
 _SCHEMA_GUARD_LOCK = threading.RLock()
 _SCHEMA_ENSURE_FUNCTIONS = (
-    # Funcoes vistas nos traces de heartbeat blocked. A v262 chama a cadeia
-    # mais nova de migracoes, mas mantemos as anteriores para cobrir deploys
-    # onde algum on_ready/task ainda invoque uma versao especifica.
     "kayn_v262_ensure_schema",
     "kayn_v255_ensure_schema",
     "kayn_v254_ensure_schema",
     "kayn_v247_ensure_schema",
-    # Cadeia acionada pelo comando !roll via vote bonus/daily missions.
     "ensure_kayn_v514_schema",
     "ensure_kayn_v508_schema",
     "ensure_daily_missions_schema",
@@ -47,8 +43,6 @@ _SCHEMA_ENSURE_FUNCTIONS = (
 _EVENT_LOOP_THREAD_GUARD_INSTALLED = False
 _EVENT_LOOP_THREAD_GUARD_LOCK = threading.RLock()
 _EVENT_LOOP_THREAD_FUNCTIONS = (
-    # Funcoes sincronas observadas travando o heartbeat via psycopg/db_conn.execute.
-    # Elas sao tarefas de manutencao/cache sem retorno critico para o fluxo do comando.
     "kayn_ensure_month_snapshot",
     "cache_discord_identity_from_author",
     "save_user_identity_cache",
@@ -60,12 +54,7 @@ _ROLL_DELIVERY_GUARD_LOCK = threading.RLock()
 
 
 def _force_required_gateway_intents() -> None:
-    """Garante intents necessarios para eventos de moderacao/servidor.
-
-    Entrada, saida, banimento e alteracao de cargos dependem do Server Members
-    Intent. Isto nao escolhe canais automaticamente: as mensagens continuam indo
-    somente para os canais configurados pelos comandos do proprio Kayn.
-    """
+    """Garante intents necessarios para eventos de moderacao/servidor."""
     try:
         os.environ["KAYN_ENABLE_MEMBERS_INTENT"] = "true"
 
@@ -103,13 +92,7 @@ def _channel_debug_name(channel: Any) -> str:
 
 
 def _install_safe_message_send() -> None:
-    """Evita que Missing Permissions derrube eventos como on_message.
-
-    O Discord retorna 403/50013 quando o Kayn tenta responder em canal sem
-    permissao de Enviar Mensagens ou Inserir Links/Embeds. Isso nao e bug de
-    codigo nem deve estourar traceback no on_message; o envio e ignorado e o
-    restante do bot continua funcionando.
-    """
+    """Evita que Missing Permissions derrube eventos como on_message."""
     try:
         if getattr(discord.abc.Messageable.send, "_kayn_safe_send", False):
             return
@@ -190,13 +173,7 @@ def _make_event_loop_thread_guard(name: str, original: Any):
 
 
 def _install_event_loop_thread_guards() -> None:
-    """Move tarefas sincronas de manutencao/cache para workers quando chamadas no loop.
-
-    O Kayn legado ainda chama algumas rotinas de Postgres diretamente em eventos
-    do discord.py. Se uma consulta ficar presa no psycopg, o heartbeat cai e os
-    cards deixam de ser entregues. Estas funcoes nao precisam bloquear o comando
-    atual, entao podem rodar fora do event loop.
-    """
+    """Move tarefas sincronas de manutencao/cache para workers quando chamadas no loop."""
     global _EVENT_LOOP_THREAD_GUARD_INSTALLED
     with _EVENT_LOOP_THREAD_GUARD_LOCK:
         if _EVENT_LOOP_THREAD_GUARD_INSTALLED:
@@ -209,72 +186,12 @@ def _install_event_loop_thread_guards() -> None:
         _EVENT_LOOP_THREAD_GUARD_INSTALLED = True
 
 
-def _roll_result_get(result: Any, *keys: str) -> Any:
-    for key in keys:
-        try:
-            if isinstance(result, dict) and result.get(key) not in (None, ""):
-                return result.get(key)
-            value = getattr(result, key, None)
-            if value not in (None, ""):
-                return value
-        except Exception:
-            continue
-    return None
-
-
-def _roll_result_fallback_message(result: Any) -> str:
-    asset = _roll_result_get(result, "asset") or {}
-    name = (
-        _roll_result_get(result, "name", "asset_name", "title", "display_name")
-        or _roll_result_get(asset, "name", "asset_name", "title", "display_name")
-        or "resultado do roll"
-    )
-    rarity = _roll_result_get(result, "rarity") or _roll_result_get(asset, "rarity")
-    kind = _roll_result_get(result, "kind", "type") or _roll_result_get(asset, "kind", "type")
-    asset_id = _roll_result_get(result, "asset_id", "id") or _roll_result_get(asset, "asset_id", "id")
-
-    parts = [f"🎲 **Resultado do roll:** **{name}**"]
-    if rarity:
-        parts.append(f"⭐ **Raridade:** `{rarity}`")
-    if kind:
-        parts.append(f"📦 **Tipo:** `{kind}`")
-    if asset_id:
-        parts.append(f"🆔 **ID:** `{asset_id}`")
-    parts.append("⚠️ O card visual falhou, mas o roll foi entregue em texto e não foi devolvido.")
-    return "\n".join(parts)[:1900]
-
-
-async def _send_roll_text_fallback(ctx: Any, result: Any) -> bool:
-    message = _roll_result_fallback_message(result)
-    allowed_mentions = discord.AllowedMentions.none()
-    for sender_name in ("reply", "send"):
-        sender = getattr(ctx, sender_name, None)
-        if not callable(sender):
-            continue
-        try:
-            kwargs = {"allowed_mentions": allowed_mentions}
-            if sender_name == "reply":
-                kwargs["mention_author"] = False
-            sent = await asyncio.wait_for(sender(message, **kwargs), timeout=8.0)
-            return sent is not None
-        except TypeError:
-            try:
-                sent = await asyncio.wait_for(sender(message), timeout=8.0)
-                return sent is not None
-            except Exception:
-                continue
-        except Exception:
-            continue
-    return False
-
-
 def _install_roll_delivery_guard() -> None:
-    """Garante que !roll entregue texto quando o card/imagem falhar.
+    """Garante que !roll so seja entregue quando o card com imagem for enviado.
 
-    O legado devolve o roll quando kayn_v86_deliver_roll_result retorna False.
-    Em producao isso estava acontecendo apenas com !roll, indicando falha no
-    envio do card/anexo/embed, nao no sorteio. Este guard tenta o card normal e,
-    se falhar, envia uma resposta textual e retorna True para evitar refund falso.
+    Regra do produto: Kayn nao entrega roll apenas em texto. Se o envio do card,
+    anexo ou embed falhar, retornamos False para o fluxo legado avisar a falha e
+    devolver o roll ao usuario.
     """
     global _ROLL_DELIVERY_GUARD_INSTALLED
     with _ROLL_DELIVERY_GUARD_LOCK:
@@ -291,17 +208,12 @@ def _install_roll_delivery_guard() -> None:
                 if ok:
                     return True
                 with contextlib.suppress(Exception):
-                    logger.warning("Kayn !roll: card delivery retornou falso; tentando fallback em texto.")
+                    logger.warning("Kayn !roll: card delivery retornou falso; roll sera devolvido.")
+                return False
             except Exception:
                 with contextlib.suppress(Exception):
-                    logger.error("Kayn !roll: card delivery falhou; tentando fallback em texto.", exc_info=True)
-
-            fallback_ok = await _send_roll_text_fallback(ctx, result)
-            if fallback_ok:
-                return True
-            with contextlib.suppress(Exception):
-                logger.error("Kayn !roll: fallback em texto tambem falhou.")
-            return False
+                    logger.error("Kayn !roll: card delivery falhou; roll sera devolvido.", exc_info=True)
+                return False
 
         guarded_roll_delivery._kayn_roll_delivery_guard = True  # type: ignore[attr-defined]
         guarded_roll_delivery._kayn_roll_delivery_original = original  # type: ignore[attr-defined]
