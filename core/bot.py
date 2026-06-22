@@ -44,6 +44,17 @@ _SCHEMA_ENSURE_FUNCTIONS = (
     "ensure_kayn_v508_schema",
     "ensure_daily_missions_schema",
 )
+_EVENT_LOOP_THREAD_GUARD_INSTALLED = False
+_EVENT_LOOP_THREAD_GUARD_LOCK = threading.RLock()
+_EVENT_LOOP_THREAD_FUNCTIONS = (
+    # Funcoes sincronas observadas travando o heartbeat via psycopg/db_conn.execute.
+    # Elas sao tarefas de manutencao/cache sem retorno critico para o fluxo do comando.
+    "kayn_ensure_month_snapshot",
+    "cache_discord_identity_from_author",
+    "save_user_identity_cache",
+    "kayn_v47_apply_due_roll_resets",
+)
+_EVENT_LOOP_THREAD_MAX_RUNNING = 4
 
 
 def _force_required_gateway_intents() -> None:
@@ -126,6 +137,74 @@ def _is_inside_running_event_loop() -> bool:
         return True
     except RuntimeError:
         return False
+
+
+def _run_in_daemon_thread(name: str, func: Any, *args: Any, **kwargs: Any) -> threading.Thread:
+    def target() -> None:
+        try:
+            func(*args, **kwargs)
+        except Exception:
+            with contextlib.suppress(Exception):
+                logger.error("Falha ao executar %s fora do event loop", name, exc_info=True)
+
+    thread = threading.Thread(target=target, name=f"kayn-{name}-worker", daemon=True)
+    thread.start()
+    return thread
+
+
+def _make_event_loop_thread_guard(name: str, original: Any):
+    running = {"count": 0}
+    lock = threading.RLock()
+
+    def guarded_function(*args: Any, **kwargs: Any):
+        if not _is_inside_running_event_loop():
+            return original(*args, **kwargs)
+
+        with lock:
+            if running["count"] >= _EVENT_LOOP_THREAD_MAX_RUNNING:
+                with contextlib.suppress(Exception):
+                    logger.warning("%s ignorado temporariamente: limite de workers DB em andamento atingido.", name)
+                return None
+            running["count"] += 1
+
+        def target() -> None:
+            try:
+                original(*args, **kwargs)
+            except Exception:
+                with contextlib.suppress(Exception):
+                    logger.error("Falha ao executar %s em worker para evitar heartbeat blocked", name, exc_info=True)
+            finally:
+                with lock:
+                    running["count"] = max(0, running["count"] - 1)
+
+        threading.Thread(target=target, name=f"kayn-{name}-worker", daemon=True).start()
+        with contextlib.suppress(Exception):
+            logger.warning("%s chamado dentro do event loop; movido para worker para evitar heartbeat blocked.", name)
+        return None
+
+    guarded_function._kayn_event_loop_thread_guard = True  # type: ignore[attr-defined]
+    guarded_function._kayn_event_loop_thread_original = original  # type: ignore[attr-defined]
+    return guarded_function
+
+
+def _install_event_loop_thread_guards() -> None:
+    """Move tarefas sincronas de manutencao/cache para workers quando chamadas no loop.
+
+    O Kayn legado ainda chama algumas rotinas de Postgres diretamente em eventos
+    do discord.py. Se uma consulta ficar presa no psycopg, o heartbeat cai e os
+    cards deixam de ser entregues. Estas funcoes nao precisam bloquear o comando
+    atual, entao podem rodar fora do event loop.
+    """
+    global _EVENT_LOOP_THREAD_GUARD_INSTALLED
+    with _EVENT_LOOP_THREAD_GUARD_LOCK:
+        if _EVENT_LOOP_THREAD_GUARD_INSTALLED:
+            return
+        for name in _EVENT_LOOP_THREAD_FUNCTIONS:
+            original = getattr(legacy, name, None)
+            if not callable(original) or getattr(original, "_kayn_event_loop_thread_guard", False):
+                continue
+            setattr(legacy, name, _make_event_loop_thread_guard(name, original))
+        _EVENT_LOOP_THREAD_GUARD_INSTALLED = True
 
 
 def _make_schema_guard(name: str, original: Any):
@@ -228,9 +307,26 @@ def _prewarm_schema_before_gateway() -> None:
             logger.warning("Kayn schema prewarm nao encontrou nenhuma funcao de schema executavel.")
 
 
+def _prewarm_maintenance_before_gateway() -> None:
+    """Executa manutencoes conhecidas antes do gateway, quando possivel."""
+    for name in ("kayn_ensure_month_snapshot",):
+        func = getattr(legacy, name, None)
+        original = getattr(func, "_kayn_event_loop_thread_original", func)
+        if not callable(original):
+            continue
+        try:
+            original()
+            with contextlib.suppress(Exception):
+                logger.info("Kayn maintenance prewarm concluido via %s antes do gateway.", name)
+        except Exception:
+            with contextlib.suppress(Exception):
+                logger.error("Falha no maintenance prewarm via %s; seguindo startup.", name, exc_info=True)
+
+
 _force_required_gateway_intents()
 _install_safe_message_send()
 _install_schema_guard()
+_install_event_loop_thread_guards()
 
 
 def _install_signal_handlers() -> None:
@@ -280,7 +376,9 @@ def run(token: Optional[str] = None, *args: Any, **kwargs: Any) -> None:
     _force_required_gateway_intents()
     _install_safe_message_send()
     _install_schema_guard()
+    _install_event_loop_thread_guards()
     _prewarm_schema_before_gateway()
+    _prewarm_maintenance_before_gateway()
     _install_signal_handlers()
 
     apply_logging = getattr(legacy, "kayn_v205_apply_error_only_logging", None)
