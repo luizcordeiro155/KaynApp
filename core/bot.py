@@ -104,7 +104,7 @@ def _install_safe_message_send() -> None:
                 code = getattr(exc, "code", None)
                 if code == 50013:
                     with contextlib.suppress(Exception):
-                        logger.warning("Kayn sem permissao para enviar mensagem em %s; envio ignorado.", _channel_debug_name(self))
+                        logger.error("Kayn sem permissao para enviar mensagem em %s; envio ignorado.", _channel_debug_name(self))
                     return None
                 raise
 
@@ -148,7 +148,7 @@ def _make_event_loop_thread_guard(name: str, original: Any):
         with lock:
             if running["count"] >= _EVENT_LOOP_THREAD_MAX_RUNNING:
                 with contextlib.suppress(Exception):
-                    logger.warning("%s ignorado temporariamente: limite de workers DB em andamento atingido.", name)
+                    logger.error("%s ignorado temporariamente: limite de workers DB em andamento atingido.", name)
                 return None
             running["count"] += 1
 
@@ -164,7 +164,7 @@ def _make_event_loop_thread_guard(name: str, original: Any):
 
         threading.Thread(target=target, name=f"kayn-{name}-worker", daemon=True).start()
         with contextlib.suppress(Exception):
-            logger.warning("%s chamado dentro do event loop; movido para worker para evitar heartbeat blocked.", name)
+            logger.debug("%s chamado dentro do event loop; movido para worker para evitar heartbeat blocked.", name)
         return None
 
     guarded_function._kayn_event_loop_thread_guard = True  # type: ignore[attr-defined]
@@ -208,7 +208,7 @@ def _install_roll_delivery_guard() -> None:
                 if ok:
                     return True
                 with contextlib.suppress(Exception):
-                    logger.warning("Kayn !roll: card delivery retornou falso; roll sera devolvido.")
+                    logger.error("Kayn !roll: card delivery retornou falso; roll sera devolvido.")
                 return False
             except Exception:
                 with contextlib.suppress(Exception):
@@ -254,7 +254,7 @@ def _make_schema_guard(name: str, original: Any):
             )
             thread.start()
             with contextlib.suppress(Exception):
-                logger.warning("%s chamado dentro do event loop; schema movido para thread para evitar heartbeat blocked.", name)
+                logger.debug("%s chamado dentro do event loop; schema movido para thread para evitar heartbeat blocked.", name)
             return None
 
         with lock:
@@ -306,7 +306,7 @@ def _prewarm_schema_before_gateway() -> None:
     _SCHEMA_PREWARMED = True
     if not any_success:
         with contextlib.suppress(Exception):
-            logger.warning("Kayn schema prewarm nao encontrou nenhuma funcao de schema executavel.")
+            logger.debug("Kayn schema prewarm nao encontrou nenhuma funcao de schema executavel.")
 
 
 def _prewarm_maintenance_before_gateway() -> None:
