@@ -10,6 +10,7 @@ import asyncio
 import contextlib
 import os
 import signal
+import threading
 from typing import Any, Optional
 
 import discord
@@ -27,6 +28,18 @@ logger = legacy.logger
 
 _original_bot_run = bot.run
 _ORIGINAL_MESSAGEABLE_SEND = discord.abc.Messageable.send
+_SCHEMA_GUARD_INSTALLED = False
+_SCHEMA_PREWARMED = False
+_SCHEMA_GUARD_LOCK = threading.RLock()
+_SCHEMA_ENSURE_FUNCTIONS = (
+    # Funcoes vistas nos traces de heartbeat blocked. A v262 chama a cadeia
+    # mais nova de migracoes, mas mantemos as anteriores para cobrir deploys
+    # onde algum on_ready/task ainda invoque uma versao especifica.
+    "kayn_v262_ensure_schema",
+    "kayn_v255_ensure_schema",
+    "kayn_v254_ensure_schema",
+    "kayn_v247_ensure_schema",
+)
 
 
 def _force_required_gateway_intents() -> None:
@@ -103,8 +116,114 @@ def _install_safe_message_send() -> None:
             logger.error("Falha instalando safe send do Kayn", exc_info=True)
 
 
+def _is_inside_running_event_loop() -> bool:
+    try:
+        asyncio.get_running_loop()
+        return True
+    except RuntimeError:
+        return False
+
+
+def _make_schema_guard(name: str, original: Any):
+    state = {"done": False, "running": False}
+    lock = threading.RLock()
+
+    def guarded_schema(*args: Any, **kwargs: Any):
+        if state["done"]:
+            return None
+
+        def run_original() -> None:
+            try:
+                original(*args, **kwargs)
+            except Exception:
+                with contextlib.suppress(Exception):
+                    logger.error("Falha ao executar %s fora do event loop", name, exc_info=True)
+                raise
+            finally:
+                with lock:
+                    state["done"] = True
+                    state["running"] = False
+
+        if _is_inside_running_event_loop():
+            with lock:
+                if state["done"] or state["running"]:
+                    return None
+                state["running"] = True
+
+            thread = threading.Thread(
+                target=run_original,
+                name=f"kayn-{name}-schema",
+                daemon=True,
+            )
+            thread.start()
+            with contextlib.suppress(Exception):
+                logger.warning("%s chamado dentro do event loop; schema movido para thread para evitar heartbeat blocked.", name)
+            return None
+
+        with lock:
+            if state["done"] or state["running"]:
+                return None
+            state["running"] = True
+        run_original()
+        return None
+
+    guarded_schema._kayn_schema_guard = True  # type: ignore[attr-defined]
+    guarded_schema._kayn_schema_original = original  # type: ignore[attr-defined]
+    return guarded_schema
+
+
+def _install_schema_guard() -> None:
+    """Evita DDL/ensure_schema sincronas no event loop do Discord.
+
+    Os logs de producao mostram heartbeat blocked enquanto on_ready/tasks chamam
+    ensure_schema() e psycopg fica aguardando cur.execute(). Essas chamadas sao
+    sincronas; se rodam no event loop, o gateway para de responder. A solucao e
+    preaquecer o schema antes do login e transformar chamadas posteriores em
+    no-op, ou thread quando ainda nao tiverem rodado.
+    """
+    global _SCHEMA_GUARD_INSTALLED
+    with _SCHEMA_GUARD_LOCK:
+        if _SCHEMA_GUARD_INSTALLED:
+            return
+        for name in _SCHEMA_ENSURE_FUNCTIONS:
+            original = getattr(legacy, name, None)
+            if not callable(original) or getattr(original, "_kayn_schema_guard", False):
+                continue
+            setattr(legacy, name, _make_schema_guard(name, original))
+        _SCHEMA_GUARD_INSTALLED = True
+
+
+def _prewarm_schema_before_gateway() -> None:
+    """Roda migracoes antes de abrir o gateway do Discord.
+
+    Se o banco demorar ou algum indice bloquear, isso atrasa apenas o startup.
+    Depois que o gateway estiver conectado, chamadas repetidas de ensure_schema
+    nao travam mais o heartbeat.
+    """
+    global _SCHEMA_PREWARMED
+    if _SCHEMA_PREWARMED or os.getenv("KAYN_SKIP_SCHEMA_PREWARM", "").lower() in {"1", "true", "yes", "on"}:
+        return
+
+    _install_schema_guard()
+    for name in _SCHEMA_ENSURE_FUNCTIONS:
+        ensure_schema = getattr(legacy, name, None)
+        if not callable(ensure_schema):
+            continue
+        try:
+            ensure_schema()
+            _SCHEMA_PREWARMED = True
+            with contextlib.suppress(Exception):
+                logger.info("Kayn schema prewarm concluido via %s antes do gateway.", name)
+            return
+        except Exception:
+            with contextlib.suppress(Exception):
+                logger.error("Falha no prewarm de schema via %s; tentando proxima opcao.", name, exc_info=True)
+    _SCHEMA_PREWARMED = True
+
+
 _force_required_gateway_intents()
 _install_safe_message_send()
+_install_schema_guard()
 
 
 def _install_signal_handlers() -> None:
@@ -153,6 +272,8 @@ def run(token: Optional[str] = None, *args: Any, **kwargs: Any) -> None:
     """Executa o bot com o mesmo backoff/limpeza do antigo bloco `if __main__`."""
     _force_required_gateway_intents()
     _install_safe_message_send()
+    _install_schema_guard()
+    _prewarm_schema_before_gateway()
     _install_signal_handlers()
 
     apply_logging = getattr(legacy, "kayn_v205_apply_error_only_logging", None)
