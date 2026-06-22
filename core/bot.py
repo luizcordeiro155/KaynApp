@@ -39,6 +39,10 @@ _SCHEMA_ENSURE_FUNCTIONS = (
     "kayn_v255_ensure_schema",
     "kayn_v254_ensure_schema",
     "kayn_v247_ensure_schema",
+    # Cadeia acionada pelo comando !roll via vote bonus/daily missions.
+    "ensure_kayn_v514_schema",
+    "ensure_kayn_v508_schema",
+    "ensure_daily_missions_schema",
 )
 
 
@@ -205,20 +209,23 @@ def _prewarm_schema_before_gateway() -> None:
         return
 
     _install_schema_guard()
+    any_success = False
     for name in _SCHEMA_ENSURE_FUNCTIONS:
         ensure_schema = getattr(legacy, name, None)
         if not callable(ensure_schema):
             continue
         try:
             ensure_schema()
-            _SCHEMA_PREWARMED = True
+            any_success = True
             with contextlib.suppress(Exception):
                 logger.info("Kayn schema prewarm concluido via %s antes do gateway.", name)
-            return
         except Exception:
             with contextlib.suppress(Exception):
                 logger.error("Falha no prewarm de schema via %s; tentando proxima opcao.", name, exc_info=True)
     _SCHEMA_PREWARMED = True
+    if not any_success:
+        with contextlib.suppress(Exception):
+            logger.warning("Kayn schema prewarm nao encontrou nenhuma funcao de schema executavel.")
 
 
 _force_required_gateway_intents()
